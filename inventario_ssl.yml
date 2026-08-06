@@ -1,0 +1,269 @@
+---
+- name: Inventory and trace SSL certificate usage on F5 BIG-IP
+  hosts: f5
+  connection: local
+  gather_facts: false
+
+  vars:
+    f5_partition: "{{ partition | default('Common') }}"
+
+    f5_provider:
+      server: "{{ ansible_host }}"
+      user: "{{ f5_username }}"
+      password: "{{ f5_password }}"
+      server_port: 443
+      validate_certs: "{{ f5_validate_certs | default(false) }}"
+
+  tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - certificate_name is defined
+          - certificate_name | trim | length > 0
+          - f5_username is defined
+          - f5_password is defined
+        fail_msg: >-
+          The variables certificate_name, f5_username and
+          f5_password are required.
+
+    # ---------------------------------------------------------
+    # 1. Consultar certificados, perfiles y Virtual Servers
+    # ---------------------------------------------------------
+
+    - name: Gather SSL certificate and virtual server information
+      f5networks.f5_modules.bigip_device_info:
+        gather_subset:
+          - ssl-certs
+          - client-ssl-profiles
+          - server-ssl-profiles
+          - virtual-servers
+        partition: "{{ f5_partition }}"
+        provider: "{{ f5_provider }}"
+      register: f5_device_info
+      delegate_to: localhost
+
+    # ---------------------------------------------------------
+    # 2. Mostrar inventario de certificados
+    # ---------------------------------------------------------
+
+    - name: Display imported certificate inventory
+      ansible.builtin.debug:
+        msg:
+          certificate: "{{ item.name }}"
+          full_path: "{{ item.full_path }}"
+          expiration_date: "{{ item.expiration_date | default('Not available') }}"
+          issuer: "{{ item.issuer | default('Not available') }}"
+          subject: "{{ item.subject | default('Not available') }}"
+          subject_alternative_name: >-
+            {{ item.subject_alternative_name | default('Not available') }}
+          key_type: "{{ item.key_type | default('Not available') }}"
+          key_size: "{{ item.key_size | default('Not available') }}"
+          fingerprint: "{{ item.fingerprint | default('Not available') }}"
+      loop: "{{ f5_device_info.ssl_certs | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # ---------------------------------------------------------
+    # 3. Buscar el certificado solicitado
+    # ---------------------------------------------------------
+
+    - name: Find requested certificate
+      ansible.builtin.set_fact:
+        selected_certificate: >-
+          {{
+            (
+              f5_device_info.ssl_certs
+              | default([])
+              | selectattr('name', 'equalto', certificate_name)
+              | list
+              | first
+            )
+            | default({})
+          }}
+
+    - name: Validate that certificate exists
+      ansible.builtin.assert:
+        that:
+          - selected_certificate | length > 0
+        fail_msg: >-
+          Certificate {{ certificate_name }} was not found
+          in partition {{ f5_partition }}.
+
+    - name: Define possible certificate references
+      ansible.builtin.set_fact:
+        certificate_references:
+          - "{{ selected_certificate.full_path }}"
+          - "{{ selected_certificate.full_path }}.crt"
+          - "/{{ f5_partition }}/{{ selected_certificate.name }}"
+          - "/{{ f5_partition }}/{{ selected_certificate.name }}.crt"
+          - "{{ selected_certificate.name }}"
+          - "{{ selected_certificate.name }}.crt"
+
+    # ---------------------------------------------------------
+    # 4. Buscar Client SSL Profiles que utilizan el certificado
+    # ---------------------------------------------------------
+
+    - name: Find Client SSL profiles using the certificate
+      ansible.builtin.set_fact:
+        client_profiles_using_certificate: >-
+          {{
+            f5_device_info.client_ssl_profiles
+            | default([])
+            | selectattr('certificate_file', 'defined')
+            | selectattr(
+                'certificate_file',
+                'in',
+                certificate_references
+              )
+            | list
+          }}
+
+    # ---------------------------------------------------------
+    # 5. Buscar Server SSL Profiles que utilizan el certificado
+    # ---------------------------------------------------------
+
+    - name: Find Server SSL profiles using the certificate
+      ansible.builtin.set_fact:
+        server_profiles_using_certificate: >-
+          {{
+            f5_device_info.server_ssl_profiles
+            | default([])
+            | selectattr('cert', 'defined')
+            | selectattr(
+                'cert',
+                'in',
+                certificate_references
+              )
+            | list
+          }}
+
+    - name: Initialize certificate usage structures
+      ansible.builtin.set_fact:
+        profile_usage: []
+        virtual_server_usage: []
+
+    - name: Add matching Client SSL profiles
+      ansible.builtin.set_fact:
+        profile_usage: >-
+          {{
+            profile_usage
+            +
+            [
+              {
+                'name': item.name,
+                'full_path': item.full_path,
+                'type': 'client-ssl',
+                'certificate': item.certificate_file
+              }
+            ]
+          }}
+      loop: "{{ client_profiles_using_certificate }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Add matching Server SSL profiles
+      ansible.builtin.set_fact:
+        profile_usage: >-
+          {{
+            profile_usage
+            +
+            [
+              {
+                'name': item.name,
+                'full_path': item.full_path,
+                'type': 'server-ssl',
+                'certificate': item.cert
+              }
+            ]
+          }}
+      loop: "{{ server_profiles_using_certificate }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Build list of matching profile paths
+      ansible.builtin.set_fact:
+        matching_profile_paths: >-
+          {{
+            profile_usage
+            | map(attribute='full_path')
+            | list
+          }}
+
+    # ---------------------------------------------------------
+    # 6. Buscar Virtual Servers que utilizan los perfiles
+    # ---------------------------------------------------------
+
+    - name: Find Virtual Servers using the SSL profiles
+      ansible.builtin.set_fact:
+        virtual_server_usage: >-
+          {{
+            virtual_server_usage
+            +
+            [
+              {
+                'name': item.name,
+                'full_path': item.full_path,
+                'destination': item.destination,
+                'enabled': item.enabled,
+                'availability_status':
+                  item.availability_status | default('unknown'),
+                'matching_profiles': matching_ssl_profiles
+              }
+            ]
+          }}
+      vars:
+        virtual_server_profile_paths: >-
+          {{
+            item.profiles
+            | default([])
+            | map(attribute='full_path')
+            | list
+          }}
+
+        matching_ssl_profiles: >-
+          {{
+            virtual_server_profile_paths
+            | intersect(matching_profile_paths)
+          }}
+      loop: "{{ f5_device_info.virtual_servers | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - matching_ssl_profiles | length > 0
+
+    # ---------------------------------------------------------
+    # 7. Construir resultado final
+    # ---------------------------------------------------------
+
+    - name: Build final certificate trace report
+      ansible.builtin.set_fact:
+        f5_certificate_trace:
+          device: "{{ inventory_hostname }}"
+          partition: "{{ f5_partition }}"
+
+          certificate:
+            name: "{{ selected_certificate.name }}"
+            full_path: "{{ selected_certificate.full_path }}"
+            expiration_date: >-
+              {{ selected_certificate.expiration_date | default('Not available') }}
+            issuer: "{{ selected_certificate.issuer | default('Not available') }}"
+            subject: "{{ selected_certificate.subject | default('Not available') }}"
+            fingerprint: >-
+              {{ selected_certificate.fingerprint | default('Not available') }}
+
+          profile_associated: "{{ profile_usage | length > 0 }}"
+          profiles: "{{ profile_usage }}"
+
+          virtual_server_associated: >-
+            {{ virtual_server_usage | length > 0 }}
+          virtual_servers: "{{ virtual_server_usage }}"
+
+    - name: Display certificate trace report
+      ansible.builtin.debug:
+        var: f5_certificate_trace
+
+    - name: Publish certificate trace information to AAP
+      ansible.builtin.set_stats:
+        data:
+          f5_certificate_trace: "{{ f5_certificate_trace }}"
+        per_host: false
