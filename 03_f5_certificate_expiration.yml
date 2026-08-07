@@ -1,0 +1,107 @@
+---
+- name: Analyze F5 SSL certificate expiration
+  hosts: f5
+  connection: local
+  gather_facts: false
+
+  vars:
+    target_partition: "{{ partition | default(f5_partition | default('Common')) }}"
+    warning_days: "{{ expiration_warning_days | default(90) | int }}"
+    critical_days: "{{ expiration_critical_days | default(30) | int }}"
+    current_epoch: "{{ lookup('pipe', 'date +%s') | int }}"
+    f5_provider:
+      server: "{{ ansible_host }}"
+      user: "{{ f5_username }}"
+      password: "{{ f5_password }}"
+      server_port: "{{ f5_server_port | default(443) }}"
+      validate_certs: "{{ f5_validate_certs | default(false) }}"
+
+  tasks:
+    - name: Validate threshold values
+      ansible.builtin.assert:
+        that:
+          - critical_days >= 0
+          - warning_days > critical_days
+          - f5_username is defined
+          - f5_password is defined
+        fail_msg: >-
+          expiration_warning_days must be greater than
+          expiration_critical_days and F5 credentials are required.
+
+    - name: Gather SSL certificates
+      f5networks.f5_modules.bigip_device_info:
+        gather_subset:
+          - ssl-certs
+        partition: "{{ target_partition }}"
+        provider: "{{ f5_provider }}"
+      register: f5_info
+      delegate_to: localhost
+      no_log: "{{ f5_no_log | default(false) }}"
+
+    - name: Initialize expiration report
+      ansible.builtin.set_fact:
+        f5_certificate_expiration_report: []
+
+    - name: Classify certificates by expiration
+      ansible.builtin.set_fact:
+        f5_certificate_expiration_report: >-
+          {{
+            f5_certificate_expiration_report
+            + [
+                {
+                  'name': item.name,
+                  'full_path': item.full_path,
+                  'expiration_date': item.expiration_date | default(''),
+                  'expiration_timestamp': item.expiration_timestamp | default(0),
+                  'days_remaining': days_remaining,
+                  'status': certificate_status,
+                  'issuer': item.issuer | default(''),
+                  'subject': item.subject | default('')
+                }
+              ]
+          }}
+      vars:
+        days_remaining: >-
+          {{ (((item.expiration_timestamp | int) - (current_epoch | int)) / 86400) | int }}
+        certificate_status: >-
+          {%- if (days_remaining | int) < 0 -%}
+          EXPIRED
+          {%- elif (days_remaining | int) <= (critical_days | int) -%}
+          CRITICAL
+          {%- elif (days_remaining | int) <= (warning_days | int) -%}
+          WARNING
+          {%- else -%}
+          OK
+          {%- endif -%}
+      loop: "{{ f5_info.ssl_certs | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Build actionable certificate list
+      ansible.builtin.set_fact:
+        f5_certificates_requiring_attention: >-
+          {{
+            f5_certificate_expiration_report
+            | rejectattr('status', 'equalto', 'OK')
+            | list
+          }}
+
+    - name: Display certificates requiring attention
+      ansible.builtin.debug:
+        var: f5_certificates_requiring_attention
+
+    - name: Display expiration summary
+      ansible.builtin.debug:
+        msg:
+          device: "{{ inventory_hostname }}"
+          total_certificates: "{{ f5_certificate_expiration_report | length }}"
+          requiring_attention: "{{ f5_certificates_requiring_attention | length }}"
+          warning_days: "{{ warning_days }}"
+          critical_days: "{{ critical_days }}"
+
+    - name: Publish expiration report to AAP
+      ansible.builtin.set_stats:
+        data:
+          f5_certificate_expiration_report: "{{ f5_certificate_expiration_report }}"
+          f5_certificates_requiring_attention: "{{ f5_certificates_requiring_attention }}"
+        per_host: false

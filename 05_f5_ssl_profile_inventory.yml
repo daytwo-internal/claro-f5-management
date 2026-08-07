@@ -1,0 +1,95 @@
+---
+- name: Inventory Client SSL and Server SSL profiles on F5 BIG-IP
+  hosts: f5
+  connection: local
+  gather_facts: false
+
+  vars:
+    target_partition: "{{ partition | default(f5_partition | default('Common')) }}"
+    f5_provider:
+      server: "{{ ansible_host }}"
+      user: "{{ f5_username }}"
+      password: "{{ f5_password }}"
+      server_port: "{{ f5_server_port | default(443) }}"
+      validate_certs: "{{ f5_validate_certs | default(false) }}"
+
+  tasks:
+    - name: Validate F5 credentials
+      ansible.builtin.assert:
+        that:
+          - f5_username is defined
+          - f5_password is defined
+        fail_msg: F5 credentials were not injected by AAP.
+
+    - name: Gather SSL profiles
+      f5networks.f5_modules.bigip_device_info:
+        gather_subset:
+          - client-ssl-profiles
+          - server-ssl-profiles
+        partition: "{{ target_partition }}"
+        provider: "{{ f5_provider }}"
+      register: f5_info
+      delegate_to: localhost
+      no_log: "{{ f5_no_log | default(false) }}"
+
+    - name: Initialize SSL profile inventory
+      ansible.builtin.set_fact:
+        f5_ssl_profile_inventory: []
+
+    - name: Add Client SSL profiles
+      ansible.builtin.set_fact:
+        f5_ssl_profile_inventory: >-
+          {{
+            f5_ssl_profile_inventory
+            + [
+                {
+                  'name': item.name,
+                  'full_path': item.full_path,
+                  'type': 'client-ssl',
+                  'parent': item.parent | default(''),
+                  'certificate': item.certificate_file | default(''),
+                  'key': item.key_file | default(''),
+                  'chain': item.chain_file | default(''),
+                  'server_name': item.server_name | default(''),
+                  'sni_default': item.sni_default | default(false),
+                  'sni_require': item.sni_require | default(false),
+                  'ciphers': item.ciphers | default('')
+                }
+              ]
+          }}
+      loop: "{{ f5_info.client_ssl_profiles | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Add Server SSL profiles
+      ansible.builtin.set_fact:
+        f5_ssl_profile_inventory: >-
+          {{
+            f5_ssl_profile_inventory
+            + [
+                {
+                  'name': item.name,
+                  'full_path': item.full_path,
+                  'type': 'server-ssl',
+                  'certificate': item.cert | default(''),
+                  'key': item.key | default(''),
+                  'chain': item.chain | default(''),
+                  'ca_file': item.ca_file | default(''),
+                  'authenticate_name': item.authenticate_name | default(''),
+                  'ciphers': item.ciphers | default('')
+                }
+              ]
+          }}
+      loop: "{{ f5_info.server_ssl_profiles | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display SSL profile inventory
+      ansible.builtin.debug:
+        var: f5_ssl_profile_inventory
+
+    - name: Publish SSL profile inventory to AAP
+      ansible.builtin.set_stats:
+        data:
+          f5_ssl_profile_inventory: "{{ f5_ssl_profile_inventory }}"
+        per_host: false

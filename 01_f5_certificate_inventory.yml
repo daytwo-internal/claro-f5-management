@@ -1,0 +1,73 @@
+---
+- name: Inventory SSL certificates on F5 BIG-IP
+  hosts: f5
+  connection: local
+  gather_facts: false
+
+  vars:
+    target_partition: "{{ partition | default(f5_partition | default('Common')) }}"
+    f5_provider:
+      server: "{{ ansible_host }}"
+      user: "{{ f5_username }}"
+      password: "{{ f5_password }}"
+      server_port: "{{ f5_server_port | default(443) }}"
+      validate_certs: "{{ f5_validate_certs | default(false) }}"
+
+  tasks:
+    - name: Validate F5 credentials
+      ansible.builtin.assert:
+        that:
+          - f5_username is defined
+          - f5_password is defined
+        fail_msg: F5 credentials were not injected by AAP.
+
+    - name: Gather SSL certificates
+      f5networks.f5_modules.bigip_device_info:
+        gather_subset:
+          - ssl-certs
+        partition: "{{ target_partition }}"
+        provider: "{{ f5_provider }}"
+      register: f5_info
+      delegate_to: localhost
+      no_log: "{{ f5_no_log | default(false) }}"
+
+    - name: Initialize certificate inventory
+      ansible.builtin.set_fact:
+        f5_certificate_inventory: []
+
+    - name: Build normalized certificate inventory
+      ansible.builtin.set_fact:
+        f5_certificate_inventory: >-
+          {{
+            f5_certificate_inventory
+            + [
+                {
+                  'name': item.name,
+                  'full_path': item.full_path,
+                  'partition': f5_partition,
+                  'subject': item.subject | default(''),
+                  'san': item.subject_alternative_name | default(''),
+                  'issuer': item.issuer | default(''),
+                  'serial_number': item.serial_no | default(''),
+                  'fingerprint': item.fingerprint | default(''),
+                  'key_type': item.key_type | default(''),
+                  'key_size': item.key_size | default(0),
+                  'expiration_date': item.expiration_date | default(''),
+                  'expiration_timestamp': item.expiration_timestamp | default(0),
+                  'is_bundle': item.is_bundle | default(false)
+                }
+              ]
+          }}
+      loop: "{{ f5_info.ssl_certs | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Display certificate inventory
+      ansible.builtin.debug:
+        var: f5_certificate_inventory
+
+    - name: Publish certificate inventory to AAP
+      ansible.builtin.set_stats:
+        data:
+          f5_certificate_inventory: "{{ f5_certificate_inventory }}"
+        per_host: false

@@ -1,0 +1,144 @@
+---
+- name: Audit SSL certificate usage by F5 virtual servers
+  hosts: f5
+  connection: local
+  gather_facts: false
+
+  vars:
+    target_partition: "{{ partition | default(f5_partition | default('Common')) }}"
+    f5_provider:
+      server: "{{ ansible_host }}"
+      user: "{{ f5_username }}"
+      password: "{{ f5_password }}"
+      server_port: "{{ f5_server_port | default(443) }}"
+      validate_certs: "{{ f5_validate_certs | default(false) }}"
+
+  tasks:
+    - name: Validate F5 credentials
+      ansible.builtin.assert:
+        that:
+          - f5_username is defined
+          - f5_password is defined
+        fail_msg: F5 credentials were not injected by AAP.
+
+    - name: Gather SSL profiles and virtual servers
+      f5networks.f5_modules.bigip_device_info:
+        gather_subset:
+          - client-ssl-profiles
+          - server-ssl-profiles
+          - virtual-servers
+        partition: "{{ target_partition }}"
+        provider: "{{ f5_provider }}"
+      register: f5_info
+      delegate_to: localhost
+      no_log: "{{ f5_no_log | default(false) }}"
+
+    - name: Initialize SSL profile map
+      ansible.builtin.set_fact:
+        ssl_profile_map: {}
+
+    - name: Add Client SSL profiles to map
+      ansible.builtin.set_fact:
+        ssl_profile_map: >-
+          {{
+            ssl_profile_map
+            | combine(
+                {
+                  item.full_path: {
+                    'name': item.name,
+                    'full_path': item.full_path,
+                    'type': 'client-ssl',
+                    'certificate': item.certificate_file | default(''),
+                    'key': item.key_file | default(''),
+                    'chain': item.chain_file | default('')
+                  }
+                }
+              )
+          }}
+      loop: "{{ f5_info.client_ssl_profiles | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Add Server SSL profiles to map
+      ansible.builtin.set_fact:
+        ssl_profile_map: >-
+          {{
+            ssl_profile_map
+            | combine(
+                {
+                  item.full_path: {
+                    'name': item.name,
+                    'full_path': item.full_path,
+                    'type': 'server-ssl',
+                    'certificate': item.cert | default(''),
+                    'key': item.key | default(''),
+                    'chain': item.chain | default('')
+                  }
+                }
+              )
+          }}
+      loop: "{{ f5_info.server_ssl_profiles | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Initialize virtual server SSL audit
+      ansible.builtin.set_fact:
+        f5_virtual_server_ssl_audit: []
+
+    - name: Build SSL audit for each virtual server
+      ansible.builtin.set_fact:
+        f5_virtual_server_ssl_audit: >-
+          {{
+            f5_virtual_server_ssl_audit
+            + [
+                {
+                  'virtual_server': item.name,
+                  'full_path': item.full_path,
+                  'destination': item.destination | default(''),
+                  'destination_address': item.destination_address | default(''),
+                  'destination_port': item.destination_port | default(0),
+                  'enabled': item.enabled | default(false),
+                  'availability_status': item.availability_status | default('unknown'),
+                  'uses_ssl': attached_ssl_profiles | length > 0,
+                  'ssl_profiles': attached_ssl_profiles,
+                  'certificates': attached_ssl_profiles | map(attribute='certificate') | reject('equalto', '') | unique | list
+                }
+              ]
+          }}
+      vars:
+        attached_profile_paths: >-
+          {{ item.profiles | default([]) | map(attribute='full_path') | list }}
+        attached_ssl_profile_paths: >-
+          {{ attached_profile_paths | intersect(ssl_profile_map.keys() | list) }}
+        attached_ssl_profiles: >-
+          {{ attached_ssl_profile_paths | map('extract', ssl_profile_map) | list }}
+      loop: "{{ f5_info.virtual_servers | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Build SSL-enabled virtual server list
+      ansible.builtin.set_fact:
+        f5_ssl_enabled_virtual_servers: >-
+          {{
+            f5_virtual_server_ssl_audit
+            | selectattr('uses_ssl', 'equalto', true)
+            | list
+          }}
+
+    - name: Display SSL-enabled virtual server audit
+      ansible.builtin.debug:
+        var: f5_ssl_enabled_virtual_servers
+
+    - name: Display virtual server audit summary
+      ansible.builtin.debug:
+        msg:
+          device: "{{ inventory_hostname }}"
+          total_virtual_servers: "{{ f5_virtual_server_ssl_audit | length }}"
+          ssl_enabled_virtual_servers: "{{ f5_ssl_enabled_virtual_servers | length }}"
+
+    - name: Publish virtual server SSL audit to AAP
+      ansible.builtin.set_stats:
+        data:
+          f5_virtual_server_ssl_audit: "{{ f5_virtual_server_ssl_audit }}"
+          f5_ssl_enabled_virtual_servers: "{{ f5_ssl_enabled_virtual_servers }}"
+        per_host: false

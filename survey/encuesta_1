@@ -1,0 +1,25 @@
+certificate_name: Movilpos_int_2024
+partition: Common
+
+02
+----------------
+
+certificate_name: Movilpos_int_2024
+
+
+03
+-----------------------------
+
+expiration_warning_days: 90
+expiration_critical_days: 30
+
+> 90 días       OK
+31 - 90 días    WARNING
+0 - 30 días     CRITICAL
+< 0 días        EXPIRED
+
+
+04
+------------------------------
+
+
