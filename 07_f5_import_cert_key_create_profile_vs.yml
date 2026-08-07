@@ -1,0 +1,218 @@
+---
+- name: Import certificate and key, create SSL profile and Virtual Server on F5 BIG-IP
+  hosts: f5_active
+  connection: local
+  gather_facts: false
+
+  vars:
+    f5_partition: "{{ partition | default('Common') }}"
+    f5_server_port: "{{ server_port | default(443) }}"
+    f5_validate_certs: "{{ validate_certs | default(false) }}"
+    f5_apply_changes: "{{ apply_changes | default(false) | bool }}"
+    f5_sync_ha: "{{ sync_ha | default(false) | bool }}"
+    f5_device_group: "{{ device_group | default('') }}"
+    f5_key_name_effective: "{{ key_name | default(certificate_name, true) }}"
+
+    f5_provider:
+      server: "{{ ansible_host }}"
+      user: "{{ f5_username }}"
+      password: "{{ f5_password }}"
+      server_port: "{{ f5_server_port }}"
+      validate_certs: "{{ f5_validate_certs }}"
+
+  pre_tasks:
+    - name: Validate requested operation
+      ansible.builtin.assert:
+        that:
+          - f5_apply_changes | bool
+          - certificate_name is defined
+          - certificate_name | trim | length > 0
+          - ssl_profile_name is defined
+          - ssl_profile_name | trim | length > 0
+          - ssl_profile_type is defined
+          - ssl_profile_type | lower in ['client', 'server']
+          - virtual_server_name is defined
+          - virtual_server_name | trim | length > 0
+          - virtual_server_destination is defined
+          - virtual_server_destination | trim | length > 0
+          - virtual_server_port is defined
+          - f5_username is defined
+          - f5_password is defined
+          - f5_certificate_pem is defined
+          - f5_certificate_pem | trim | length > 0
+          - f5_private_key_pem is defined
+          - f5_private_key_pem | trim | length > 0
+        fail_msg: >-
+          Required data is missing or apply_changes is false.
+          Required: certificate_name, ssl_profile_name, ssl_profile_type
+          (client/server), virtual_server_name, virtual_server_destination,
+          virtual_server_port, F5 credential, certificate PEM and private key PEM.
+
+    - name: Validate HA sync parameters when requested
+      ansible.builtin.assert:
+        that:
+          - f5_device_group | trim | length > 0
+        fail_msg: "device_group is required when sync_ha=true."
+      when: f5_sync_ha | bool
+
+    - name: Build client certificate-key chain object
+      ansible.builtin.set_fact:
+        f5_client_cert_key_chain:
+          cert: "{{ certificate_name }}"
+          key: "{{ f5_key_name_effective }}"
+
+    - name: Add private key passphrase to client certificate-key chain when provided
+      ansible.builtin.set_fact:
+        f5_client_cert_key_chain: >-
+          {{
+            f5_client_cert_key_chain
+            | combine({'passphrase': f5_private_key_passphrase})
+          }}
+      when:
+        - f5_private_key_passphrase is defined
+        - f5_private_key_passphrase | length > 0
+      no_log: true
+
+  tasks:
+    - name: Import SSL certificate into BIG-IP
+      f5networks.f5_modules.bigip_ssl_certificate:
+        state: present
+        name: "{{ certificate_name }}"
+        partition: "{{ f5_partition }}"
+        content: "{{ f5_certificate_pem }}"
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: certificate_import
+      no_log: true
+
+    - name: Import SSL private key into BIG-IP
+      f5networks.f5_modules.bigip_ssl_key:
+        state: present
+        name: "{{ f5_key_name_effective }}"
+        partition: "{{ f5_partition }}"
+        content: "{{ f5_private_key_pem }}"
+        passphrase: "{{ f5_private_key_passphrase | default(omit, true) }}"
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: key_import
+      no_log: true
+
+    - name: Create Client SSL profile
+      f5networks.f5_modules.bigip_profile_client_ssl:
+        state: present
+        name: "{{ ssl_profile_name }}"
+        partition: "{{ f5_partition }}"
+        cert_key_chain: "{{ [f5_client_cert_key_chain] }}"
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: client_ssl_profile
+      when: ssl_profile_type | lower == 'client'
+
+    - name: Create Server SSL profile
+      f5networks.f5_modules.bigip_profile_server_ssl:
+        state: present
+        name: "{{ ssl_profile_name }}"
+        partition: "{{ f5_partition }}"
+        certificate: "{{ certificate_name }}"
+        key: "{{ f5_key_name_effective }}"
+        passphrase: "{{ f5_private_key_passphrase | default(omit, true) }}"
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: server_ssl_profile
+      when: ssl_profile_type | lower == 'server'
+      no_log: "{{ (f5_private_key_passphrase | default('') | length) > 0 }}"
+
+    - name: Build Virtual Server profile list
+      ansible.builtin.set_fact:
+        f5_virtual_server_profiles:
+          - name: /Common/tcp
+            context: all
+          - name: "/{{ f5_partition }}/{{ ssl_profile_name }}"
+            context: "{{ 'client-side' if ssl_profile_type | lower == 'client' else 'server-side' }}"
+
+    - name: Add HTTP profile when requested
+      ansible.builtin.set_fact:
+        f5_virtual_server_profiles: >-
+          {{
+            f5_virtual_server_profiles
+            +
+            [
+              {
+                'name': '/Common/http',
+                'context': 'all'
+              }
+            ]
+          }}
+      when: add_http_profile | default(false) | bool
+
+    - name: Create Virtual Server and associate SSL profile
+      f5networks.f5_modules.bigip_virtual_server:
+        state: present
+        name: "{{ virtual_server_name }}"
+        partition: "{{ f5_partition }}"
+        destination: "{{ virtual_server_destination }}"
+        port: "{{ virtual_server_port }}"
+        type: standard
+        pool: "{{ virtual_server_pool | default(omit, true) }}"
+        snat: "{{ virtual_server_snat | default(omit, true) }}"
+        description: "{{ virtual_server_description | default('Created by Ansible Automation Platform') }}"
+        profiles: "{{ f5_virtual_server_profiles }}"
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: virtual_server_create
+
+    - name: Save BIG-IP running configuration
+      f5networks.f5_modules.bigip_config:
+        save: true
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: save_configuration
+
+    - name: Sync configuration from active device to HA device group
+      f5networks.f5_modules.bigip_configsync_action:
+        device_group: "{{ f5_device_group }}"
+        sync_device_to_group: true
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: config_sync
+      when: f5_sync_ha | bool
+
+    - name: Build deployment result
+      ansible.builtin.set_fact:
+        f5_ssl_deployment_result:
+          device: "{{ inventory_hostname }}"
+          partition: "{{ f5_partition }}"
+          certificate:
+            name: "{{ certificate_name }}"
+            changed: "{{ certificate_import.changed | default(false) }}"
+          key:
+            name: "{{ f5_key_name_effective }}"
+            changed: "{{ key_import.changed | default(false) }}"
+          ssl_profile:
+            name: "{{ ssl_profile_name }}"
+            type: "{{ ssl_profile_type | lower }}"
+            context: "{{ 'client-side' if ssl_profile_type | lower == 'client' else 'server-side' }}"
+            changed: >-
+              {{
+                client_ssl_profile.changed | default(false)
+                if ssl_profile_type | lower == 'client'
+                else server_ssl_profile.changed | default(false)
+              }}
+          virtual_server:
+            name: "{{ virtual_server_name }}"
+            destination: "{{ virtual_server_destination }}"
+            port: "{{ virtual_server_port }}"
+            pool: "{{ virtual_server_pool | default('Not configured') }}"
+            changed: "{{ virtual_server_create.changed | default(false) }}"
+          configuration_saved: true
+          ha_sync_requested: "{{ f5_sync_ha | bool }}"
+
+    - name: Display deployment result
+      ansible.builtin.debug:
+        var: f5_ssl_deployment_result
+
+    - name: Publish deployment result to AAP
+      ansible.builtin.set_stats:
+        data:
+          f5_ssl_deployment_result: "{{ f5_ssl_deployment_result }}"
+        per_host: false
