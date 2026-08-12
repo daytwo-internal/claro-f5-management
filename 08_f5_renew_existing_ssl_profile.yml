@@ -1,0 +1,271 @@
+---
+- name: Renew certificate and key on an existing F5 SSL profile
+  hosts: f5_active
+  connection: local
+  gather_facts: false
+
+  vars:
+    f5_partition: "{{ partition | default('Common') }}"
+    f5_server_port: "{{ server_port | default(443) }}"
+    f5_validate_certs: "{{ validate_certs | default(false) }}"
+    f5_apply_changes: "{{ apply_changes | default(false) | bool }}"
+    f5_sync_ha: "{{ sync_ha | default(false) | bool }}"
+    f5_device_group: "{{ device_group | default('') }}"
+    f5_new_key_name: "{{ new_key_name | default(new_certificate_name, true) }}"
+
+    f5_provider:
+      server: "{{ ansible_host }}"
+      user: "{{ f5_username }}"
+      password: "{{ f5_password }}"
+      server_port: "{{ f5_server_port }}"
+      validate_certs: "{{ f5_validate_certs }}"
+
+  pre_tasks:
+    - name: Validate required variables
+      ansible.builtin.assert:
+        that:
+          - f5_apply_changes | bool
+          - ssl_profile_name is defined
+          - ssl_profile_name | trim | length > 0
+          - ssl_profile_type is defined
+          - ssl_profile_type | lower in ['client', 'server']
+          - new_certificate_name is defined
+          - new_certificate_name | trim | length > 0
+          - f5_username is defined
+          - f5_password is defined
+        fail_msg: >-
+          Missing required data or apply_changes=false.
+          Required: ssl_profile_name, ssl_profile_type,
+          new_certificate_name and F5 credential.
+
+    - name: Validate device group when HA sync is requested
+      ansible.builtin.assert:
+        that:
+          - f5_device_group | trim | length > 0
+        fail_msg: "device_group is required when sync_ha=true."
+      when: f5_sync_ha | bool
+
+  tasks:
+    - name: Gather profiles, certificates and keys before renewal
+      f5networks.f5_modules.bigip_device_info:
+        gather_subset:
+          - client-ssl-profiles
+          - server-ssl-profiles
+          - ssl-certs
+          - ssl-keys
+        partition: "{{ f5_partition }}"
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: f5_before
+
+    - name: Select existing SSL profile
+      ansible.builtin.set_fact:
+        f5_existing_profile: >-
+          {{
+            (
+              (
+                f5_before.client_ssl_profiles
+                if ssl_profile_type | lower == 'client'
+                else f5_before.server_ssl_profiles
+              )
+              | default([])
+              | selectattr('name', 'equalto', ssl_profile_name)
+              | list
+              | first
+            )
+            | default({})
+          }}
+
+    - name: Select new certificate and key
+      ansible.builtin.set_fact:
+        f5_new_certificate_object: >-
+          {{
+            (
+              f5_before.ssl_certs
+              | default([])
+              | selectattr('name', 'equalto', new_certificate_name)
+              | list
+              | first
+            )
+            | default({})
+          }}
+        f5_new_key_object: >-
+          {{
+            (
+              f5_before.ssl_keys
+              | default([])
+              | selectattr('name', 'equalto', f5_new_key_name)
+              | list
+              | first
+            )
+            | default({})
+          }}
+
+    - name: Validate profile, certificate and key exist
+      ansible.builtin.assert:
+        that:
+          - f5_existing_profile | length > 0
+          - f5_new_certificate_object | length > 0
+          - f5_new_key_object | length > 0
+        fail_msg: >-
+          Confirm that profile '{{ ssl_profile_name }}',
+          certificate '{{ new_certificate_name }}' and
+          key '{{ f5_new_key_name }}' exist in partition '{{ f5_partition }}'.
+
+    - name: Capture current association
+      ansible.builtin.set_fact:
+        f5_old_certificate: >-
+          {{
+            f5_existing_profile.certificate_file
+            | default(f5_existing_profile.cert | default(''))
+          }}
+        f5_old_key: >-
+          {{
+            f5_existing_profile.key_file
+            | default(f5_existing_profile.key | default(''))
+          }}
+        f5_old_chain: >-
+          {{
+            f5_existing_profile.chain_file
+            | default(f5_existing_profile.chain | default(''))
+          }}
+
+    - name: Determine chain to preserve or replace
+      ansible.builtin.set_fact:
+        f5_effective_chain: "{{ new_chain_name | default(f5_old_chain, true) }}"
+
+    - name: Show renewal plan
+      ansible.builtin.debug:
+        msg:
+          - "SSL Profile: {{ ssl_profile_name }}"
+          - "Type: {{ ssl_profile_type | lower }}"
+          - "Old certificate: {{ f5_old_certificate }}"
+          - "Old key: {{ f5_old_key }}"
+          - "New certificate: {{ new_certificate_name }}"
+          - "New key: {{ f5_new_key_name }}"
+          - "Virtual Server will not be modified."
+
+    - name: Build Client SSL certificate-key chain
+      ansible.builtin.set_fact:
+        f5_client_cert_key_chain:
+          cert: "{{ new_certificate_name }}"
+          key: "{{ f5_new_key_name }}"
+      when: ssl_profile_type | lower == 'client'
+
+    - name: Preserve or replace Client SSL chain
+      ansible.builtin.set_fact:
+        f5_client_cert_key_chain: >-
+          {{
+            f5_client_cert_key_chain
+            | combine({'chain': f5_effective_chain})
+          }}
+      when:
+        - ssl_profile_type | lower == 'client'
+        - f5_effective_chain | default('') | length > 0
+
+    - name: Update existing Client SSL profile
+      f5networks.f5_modules.bigip_profile_client_ssl:
+        state: present
+        name: "{{ ssl_profile_name }}"
+        partition: "{{ f5_partition }}"
+        cert_key_chain:
+          - "{{ f5_client_cert_key_chain }}"
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: renew_client_profile
+      when: ssl_profile_type | lower == 'client'
+
+    - name: Update existing Server SSL profile
+      f5networks.f5_modules.bigip_profile_server_ssl:
+        state: present
+        name: "{{ ssl_profile_name }}"
+        partition: "{{ f5_partition }}"
+        certificate: "{{ new_certificate_name }}"
+        key: "{{ f5_new_key_name }}"
+        chain: "{{ f5_effective_chain | default(omit, true) }}"
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: renew_server_profile
+      when: ssl_profile_type | lower == 'server'
+
+    - name: Save BIG-IP running configuration
+      f5networks.f5_modules.bigip_config:
+        save: true
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+
+    - name: Sync renewed configuration to HA device group
+      f5networks.f5_modules.bigip_configsync_action:
+        device_group: "{{ f5_device_group }}"
+        sync_device_to_group: true
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      when: f5_sync_ha | bool
+
+    - name: Gather profiles after renewal
+      f5networks.f5_modules.bigip_device_info:
+        gather_subset:
+          - client-ssl-profiles
+          - server-ssl-profiles
+        partition: "{{ f5_partition }}"
+        provider: "{{ f5_provider }}"
+      delegate_to: localhost
+      register: f5_after
+
+    - name: Select renewed SSL profile
+      ansible.builtin.set_fact:
+        f5_renewed_profile: >-
+          {{
+            (
+              (
+                f5_after.client_ssl_profiles
+                if ssl_profile_type | lower == 'client'
+                else f5_after.server_ssl_profiles
+              )
+              | default([])
+              | selectattr('name', 'equalto', ssl_profile_name)
+              | list
+              | first
+            )
+            | default({})
+          }}
+
+    - name: Capture profile association after renewal
+      ansible.builtin.set_fact:
+        f5_post_certificate: >-
+          {{
+            f5_renewed_profile.certificate_file
+            | default(f5_renewed_profile.cert | default(''))
+          }}
+        f5_post_key: >-
+          {{
+            f5_renewed_profile.key_file
+            | default(f5_renewed_profile.key | default(''))
+          }}
+
+    - name: Validate renewal
+      ansible.builtin.assert:
+        that:
+          - f5_renewed_profile | length > 0
+          - new_certificate_name in f5_post_certificate
+          - f5_new_key_name in f5_post_key
+        success_msg: >-
+          Profile '{{ ssl_profile_name }}' now uses certificate
+          '{{ new_certificate_name }}' and key '{{ f5_new_key_name }}'.
+
+    - name: Publish renewal result
+      ansible.builtin.set_stats:
+        data:
+          f5_certificate_renewal_result:
+            profile: "{{ ssl_profile_name }}"
+            type: "{{ ssl_profile_type | lower }}"
+            old_certificate: "{{ f5_old_certificate }}"
+            old_key: "{{ f5_old_key }}"
+            new_certificate: "{{ f5_post_certificate }}"
+            new_key: "{{ f5_post_key }}"
+            certificate_expiration: "{{ f5_new_certificate_object.expiration_date | default('Not available') }}"
+            virtual_server_modified: false
+            configuration_saved: true
+            ha_sync_requested: "{{ f5_sync_ha | bool }}"
+            result: SUCCESS
+        per_host: false

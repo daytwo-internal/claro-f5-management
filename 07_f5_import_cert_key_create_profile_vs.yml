@@ -1,6 +1,6 @@
 ---
 - name: Import certificate and key, create SSL profile and Virtual Server on F5 BIG-IP
-  hosts: f5_active
+  hosts: f5
   connection: local
   gather_facts: false
 
